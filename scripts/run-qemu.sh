@@ -1082,7 +1082,7 @@ refresh_lp_membership() {
 }
 
 refresh_lp_membership
-if [[ $EUID -ne 0 ]] && encore_runtime_needs_root_phase "$RUNTIME_BACKEND"; then
+if [[ "$(uname -s)" != Darwin && $EUID -ne 0 ]] && encore_runtime_needs_root_phase "$RUNTIME_BACKEND"; then
   runtime_owner="$(id -un)"
   if command -v run0 >/dev/null 2>&1 && command -v pkttyagent >/dev/null 2>&1; then
     run0 --description="Encore runtime preparation" -- \
@@ -1106,7 +1106,9 @@ if [[ $EUID -ne 0 ]] && encore_runtime_needs_root_phase "$RUNTIME_BACKEND"; then
   resolve_qemu_bin
 fi
 refresh_lp_membership
-if [[ $runtime_root_phase -eq 0 ]]; then
+if [[ "$(uname -s)" == Darwin ]]; then
+  : # macOS: no apt/udev runtime preparation
+elif [[ $runtime_root_phase -eq 0 ]]; then
   encore_prepare_runtime "$RUNTIME_BACKEND"
 else
   case "$RUNTIME_BACKEND" in

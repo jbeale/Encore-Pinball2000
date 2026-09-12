@@ -1,0 +1,29 @@
+--- a/ui/sdl2.c	2026-09-12 11:41:10
++++ b/ui/sdl2.c	2026-09-12 11:41:01
+@@ -55,6 +55,8 @@
+ static Notifier mouse_mode_notifier;
+ 
+ #define SDL2_REFRESH_INTERVAL_BUSY 10
++/* Encore/macOS: refresh the SDL window at ~60 Hz instead of QEMU's 30 ms default. */
++#define P2K_SDL_REFRESH_MS 16
+ #define SDL2_MAX_IDLE_COUNT (2 * GUI_REFRESH_INTERVAL_DEFAULT \
+                              / SDL2_REFRESH_INTERVAL_BUSY + 1)
+ 
+@@ -623,7 +625,7 @@
+         }
+         break;
+     case SDL_WINDOWEVENT_RESTORED:
+-        update_displaychangelistener(&scon->dcl, GUI_REFRESH_INTERVAL_DEFAULT);
++        update_displaychangelistener(&scon->dcl, P2K_SDL_REFRESH_MS);
+         break;
+     case SDL_WINDOWEVENT_MINIMIZED:
+         update_displaychangelistener(&scon->dcl, 500);
+@@ -710,7 +712,7 @@
+         if (scon->idle_counter < SDL2_MAX_IDLE_COUNT) {
+             scon->idle_counter++;
+             if (scon->idle_counter >= SDL2_MAX_IDLE_COUNT) {
+-                scon->dcl.update_interval = GUI_REFRESH_INTERVAL_DEFAULT;
++                scon->dcl.update_interval = P2K_SDL_REFRESH_MS;
+             }
+         }
+     } else {

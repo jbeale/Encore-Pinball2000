@@ -305,10 +305,14 @@ const char *p2k_lpt_resolve_game(const char *requested_game)
         exit(1);
     }
     if (s_lpt_disabled || s_disconnected) {
+        snprintf(s_resolved_game, sizeof(s_resolved_game), "%s",
+                 game_auto ? "swe1" : requested_game);
         return game_auto ? "swe1" : requested_game;
     }
     if (!strcmp(selection, "emulated")) {
         info_report("pinball2000: LPT device emulated — physical ports ignored");
+        snprintf(s_resolved_game, sizeof(s_resolved_game), "%s",
+                 game_auto ? "swe1" : requested_game);
         return game_auto ? "swe1" : requested_game;
     }
 #ifdef __linux__
@@ -340,6 +344,8 @@ const char *p2k_lpt_resolve_game(const char *requested_game)
         }
         info_report("pinball2000: explicit %s gave no recognizable playfield signature; preserving raw passthrough for guest diagnostics",
                     explicit_path);
+        snprintf(s_resolved_game, sizeof(s_resolved_game), "%s",
+                 game_auto ? "swe1" : requested_game);
         return game_auto ? "swe1" : requested_game;
     }
 
@@ -372,7 +378,9 @@ const char *p2k_lpt_resolve_game(const char *requested_game)
     }
     info_report("pinball2000: no recognized physical driver board; using emulated board");
     s_hybrid_input = false;
-    return game_auto ? "swe1" : requested_game;
+    snprintf(s_resolved_game, sizeof(s_resolved_game), "%s",
+                 game_auto ? "swe1" : requested_game);
+        return game_auto ? "swe1" : requested_game;
 }
 
 /* P2K rendering/switch state machine (mirrors io.c:720-742). */
@@ -387,6 +395,174 @@ static uint8_t s_rendering_data_val;
 static uint8_t s_lamp_rows[8];
 static uint8_t s_switch_matrix[8];
 static uint8_t s_keymap_switch_matrix[8];
+
+/* ---------- virtual ball flow (Revenge From Mars) -------------------------
+ * The RFM manual marks matrix switches 41-47, 51 and 52 as optos that read
+ * CLOSED with no ball present.  Reporting every switch open therefore told
+ * the game that a ball sat in every device, and it ran ball search forever
+ * (lockup kick, popper kick, trough eject every 1.5 s).  This small model
+ * keeps four balls in the trough, moves one to the shooter lane when the
+ * game fires Trough Eject, releases it when the Autoplunger fires, lets
+ * balls enter/leave the popper and lockup, and returns a ball to the trough
+ * on an outlane hit or Backspace.
+ *
+ * Output bytes (learned with `drive N` + --lpt-trace): opcode 0x0A carries
+ * solenoids 8-15 (bit0 Trough Eject, bit6 Autoplunger, bit7 Right Lockup),
+ * opcode 0x0B carries solenoids 0-7 (bit7 Right Popper). */
+static bool       s_ballsim;
+static int        s_bs_trough = 4;
+static int        s_bs_in_play;
+static bool       s_bs_shooter, s_bs_popper, s_bs_lockup;
+static QEMUTimer *s_bs_eject_timer, *s_bs_plunge_timer, *s_bs_drain_timer;
+static uint8_t    s_coil_prev[16];
+
+static uint8_t p2k_bs_baseline(unsigned slot)
+{
+    uint8_t v = 0;
+    if (!s_ballsim) {
+        return 0;
+    }
+    switch (slot) {
+    case 1:                                  /* column 1 */
+        if (s_bs_shooter) v |= 1u << 7;      /* 18 Shooter Lane */
+        break;
+    case 4:                                  /* column 4: all optos */
+        v |= 1u << 0;                        /* 41 Trough Jam: no jam */
+        for (int i = 1; i <= 4; i++) {       /* 42-45 Trough Ball 1-4 */
+            if (i > s_bs_trough) v |= 1u << i;
+        }
+        if (!s_bs_popper) v |= 1u << 5;      /* 46 Right Popper */
+        v |= 1u << 6;                        /* 47 Jet Exit */
+        break;
+    case 5:
+        if (!s_bs_lockup) v |= 1u << 0;      /* 51 Right Lockup 1 */
+        v |= 1u << 1;                        /* 52 Left Ramp Entrance */
+        break;
+    default:
+        break;
+    }
+    return v;
+}
+
+static void p2k_bs_log(const char *what)
+{
+    fprintf(stderr, "[ball] %s  (trough=%d shooter=%d in_play=%d popper=%d lockup=%d)\n",
+            what, s_bs_trough, s_bs_shooter, s_bs_in_play, s_bs_popper, s_bs_lockup);
+}
+
+static void p2k_bs_eject_cb(void *opaque)
+{
+    s_bs_shooter = true;
+    p2k_bs_log("ball arrived in shooter lane");
+}
+
+static void p2k_bs_plunge_cb(void *opaque)
+{
+    if (s_bs_shooter) {
+        s_bs_shooter = false;
+        s_bs_in_play++;
+        p2k_bs_log("ball launched into play");
+    }
+}
+
+static void p2k_bs_drain_cb(void *opaque)
+{
+    if (s_bs_in_play > 0) {
+        s_bs_in_play--;
+    }
+    if (s_bs_trough < 4) {
+        s_bs_trough++;
+    }
+    p2k_bs_log("ball drained back to trough");
+}
+
+static void p2k_bs_drain_request(const char *source)
+{
+    if (!s_ballsim) {
+        return;
+    }
+    if (timer_pending(s_bs_drain_timer)) {
+        return;
+    }
+    fprintf(stderr, "[ball] drain requested by %s\n", source);
+    timer_mod(s_bs_drain_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 700 * SCALE_MS);
+}
+
+/* Switch-side hooks. Returns true when the press was consumed. */
+static bool p2k_bs_switch_hook(unsigned number, bool down)
+{
+    if (!s_ballsim) {
+        return false;
+    }
+    switch (number) {
+    case 46:                                 /* Right Popper opto */
+        if (down && !s_bs_popper) {
+            s_bs_popper = true;
+            p2k_bs_log("ball entered right popper");
+        }
+        return true;
+    case 51:                                 /* Right Lockup opto */
+        if (down && !s_bs_lockup) {
+            s_bs_lockup = true;
+            p2k_bs_log("ball entered right lockup");
+        }
+        return true;
+    case 16:                                 /* Left Outlane */
+    case 27:                                 /* Right Outlane */
+        if (down) {
+            p2k_bs_drain_request(number == 16 ? "left outlane" : "right outlane");
+        }
+        return false;                        /* still report the switch */
+    default:
+        return false;
+    }
+}
+
+/* Solenoid-side hooks: react to rising edges on the output bytes. */
+static void p2k_bs_coil_edges(uint8_t opcode, uint8_t data)
+{
+    if (!s_ballsim || opcode >= 16) {
+        return;
+    }
+    uint8_t rising = data & (uint8_t)~s_coil_prev[opcode];
+    s_coil_prev[opcode] = data;
+    if (!rising) {
+        return;
+    }
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (opcode == 0x0a) {
+        if (rising & 0x01) {                 /* Trough Eject */
+            if (s_bs_trough > 0 && !s_bs_shooter &&
+                !timer_pending(s_bs_eject_timer)) {
+                s_bs_trough--;
+                p2k_bs_log("trough eject fired");
+                timer_mod(s_bs_eject_timer, now + 250 * SCALE_MS);
+            } else {
+                p2k_bs_log("trough eject fired but nothing to serve");
+            }
+        }
+        if (rising & 0x40) {                 /* Autoplunger */
+            if (s_bs_shooter && !timer_pending(s_bs_plunge_timer)) {
+                p2k_bs_log("autoplunger fired");
+                timer_mod(s_bs_plunge_timer, now + 150 * SCALE_MS);
+            }
+        }
+        if (rising & 0x80) {                 /* Right Lockup kick */
+            if (s_bs_lockup) {
+                s_bs_lockup = false;
+                p2k_bs_log("lockup kicked ball out");
+            }
+        }
+    } else if (opcode == 0x0b) {
+        if (rising & 0x80) {                 /* Right Popper kick */
+            if (s_bs_popper) {
+                s_bs_popper = false;
+                p2k_bs_log("popper kicked ball out");
+            }
+        }
+    }
+}
 static uint8_t s_data_val2;
 static int     s_access_mode4_prev;
 static int     s_access_mode1_prev;
@@ -439,7 +615,8 @@ static int calc_bitwise_sum(uint8_t val)
 
 static uint8_t p2k_matrix_slot(unsigned slot)
 {
-    return s_switch_matrix[slot & 7] | s_keymap_switch_matrix[slot & 7];
+    return (s_switch_matrix[slot & 7] | s_keymap_switch_matrix[slot & 7]) ^
+           p2k_bs_baseline(slot & 7);
 }
 
 static bool p2k_set_switch_layer(uint8_t matrix[8], unsigned number, bool down)
@@ -452,6 +629,9 @@ static bool p2k_set_switch_layer(uint8_t matrix[8], unsigned number, bool down)
     }
     unsigned slot = column & 7;
     uint8_t mask = 1u << (row - 1);
+    if (p2k_bs_switch_hook(number, down)) {
+        return true;
+    }
     bool previous = (p2k_matrix_slot(slot) & mask) != 0;
     if (down) {
         matrix[slot] |= mask;
@@ -625,6 +805,7 @@ static uint8_t retrieve_hybrid_input_mask(uint8_t opcode)
 
 static void process_data_command(uint8_t opcode, uint8_t data)
 {
+    p2k_bs_coil_edges(opcode, data);
     switch (opcode) {
     case 0x05:
         s_rendering_data_val = data;
@@ -765,6 +946,9 @@ static void p2k_lpt_dump_state(void)
         !!(p2k_matrix_slot(1) & (1u << 2)),
         s_rendering_flags, s_lpt_data, s_data_for_rendering,
         s_lamp_rows[1], p2k_matrix_slot(1));
+    if (s_ballsim) {
+        p2k_bs_log("state");
+    }
 }
 
 /* Pipe RGB to a JPEG-producing helper (cjpeg / magick / convert).
@@ -899,6 +1083,15 @@ void p2k_lpt_host_key(int qcode, bool down)
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
         }
         break;
+    case Q_KEY_CODE_BACKSPACE:                       /* virtual ball drain */
+        if (down) {
+            if (s_ballsim) {
+                p2k_bs_drain_request("Backspace");
+            } else {
+                fprintf(stderr, "[lpt] Backspace: virtual ball model inactive\n");
+            }
+        }
+        break;
     case Q_KEY_CODE_F4:
         if (down) {
             if (s_hybrid_input) {
@@ -943,14 +1136,16 @@ void p2k_lpt_host_key(int qcode, bool down)
         break;
     case Q_KEY_CODE_DOWN:                            /* Volume− / Menu Down */
     case Q_KEY_CODE_KP_SUBTRACT:
-        if (down) s_phys9_service |=  (1u << 1);
-        else      s_phys9_service &= ~(1u << 1);
+        /* Bit order verified in RFM 1.60 service menus: bit2 is the
+         * coin-door "-"/Down button, bit1 is "+"/Up. */
+        if (down) s_phys9_service |=  (1u << 2);
+        else      s_phys9_service &= ~(1u << 2);
         break;
     case Q_KEY_CODE_UP:                              /* Volume+ / Menu Up */
     case Q_KEY_CODE_KP_ADD:
     case Q_KEY_CODE_EQUAL:
-        if (down) s_phys9_service |=  (1u << 2);
-        else      s_phys9_service &= ~(1u << 2);
+        if (down) s_phys9_service |=  (1u << 1);
+        else      s_phys9_service &= ~(1u << 1);
         break;
     case Q_KEY_CODE_RIGHT:                           /* Begin Test / Enter */
         if (down) s_phys9_service |=  (1u << 3);
@@ -1112,6 +1307,15 @@ void p2k_install_lpt_board(void)
                     "closures only; outputs and keepalive remain physical");
     }
 
+    s_ballsim = !p2k_lpt_blocks_emulated_input() &&
+                !strcmp(s_resolved_game, "rfm");
+    if (s_ballsim) {
+        s_bs_eject_timer  = timer_new_ns(QEMU_CLOCK_VIRTUAL, p2k_bs_eject_cb, NULL);
+        s_bs_plunge_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, p2k_bs_plunge_cb, NULL);
+        s_bs_drain_timer  = timer_new_ns(QEMU_CLOCK_VIRTUAL, p2k_bs_drain_cb, NULL);
+        info_report("pinball2000: RFM virtual ball model ON: 4 balls in trough, "
+                    "optos 41-47/51/52 read closed; Backspace or an outlane drains the ball");
+    }
     info_report("pinball2000: LPT driver-board installed at I/O 0x%x-0x%x "
                 "(STATUS=0x%02x, edge-detect dispatch%s)",
                 ioport, ioport + 2, s_lpt_status,
@@ -1123,7 +1327,7 @@ void p2k_install_lpt_board(void)
                 "F4 door | F5/Enter pulse | F6/F9 actions | "
                 "F7/F8 flippers | Space/S start | F10/C coin | "
                 "F12 dump | Esc/Left service | Up/Down volume | "
-                "Right enter | NN then Ctrl matrix switch");
+                "Right enter | Backspace drain ball | NN then Ctrl matrix switch");
 }
 
 bool p2k_lpt_blocks_emulated_input(void)

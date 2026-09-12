@@ -1173,7 +1173,10 @@ static void adsp_render_direct(int16_t *samples, int frames, int output_rate,
         for (int channel = 0; channel < 2; channel++) {
             int16_t sample = s_adsp.sport_enabled ?
                              s_adsp.last_sample[channel] : 0;
-            samples[n * 2 + channel] = sample;
+            /* The first SPORT word of each pair is the RIGHT channel on the
+             * Pinball 2000 DCS board (verified by ear in RFM 1.60), so swap
+             * when writing interleaved L/R host frames. */
+            samples[n * 2 + (1 - channel)] = sample;
             if (sample) {
                 unsigned magnitude = sample == INT16_MIN ? 32768 :
                                      abs(sample);

@@ -231,9 +231,21 @@ if [[ ! -f "$PATCHSET_SENTINEL" ]]; then
     --version "$QEMU_VER"
   echo "$PATCHSET_HASH" > "$PATCHSET_SENTINEL"
 fi
+if [[ "$(uname -s)" == Darwin && ! -f "$SRC/.p2k-macos-patched" ]]; then
+  for mp in "$ROOT"/macos/*.patch; do
+    [[ -e "$mp" ]] || continue
+    echo "[build-qemu] applying macOS patch $(basename "$mp")"
+    (cd "$SRC" && patch -p1 -N < "$mp")
+  done
+  touch "$SRC/.p2k-macos-patched"
+fi
 
 # --- Inject our machine source ---------------------------------------------
-"$ROOT/guest-extensions/build.sh" --check
+if command -v objcopy >/dev/null 2>&1 && echo 'int x;' | gcc -m32 -c -x c - -o /dev/null 2>/dev/null; then
+  "$ROOT/guest-extensions/build.sh" --check
+else
+  echo "[build-qemu] NOTE: no x86 ELF toolchain on this host; trusting committed guest-extension payload"
+fi
 HW_I386="$SRC/hw/i386"
 UPDATED_FILES=0
 copy_if_changed() {

@@ -1,0 +1,36 @@
+# Encore A-Z matrix-switch bindings — Revenge From Mars layout.
+# Hold a letter to close that switch. Built-ins still apply: Space start, C coin,
+# F7/F8 flippers, F6/F9 action buttons, Backspace drain, F4 coin door, NN+Ctrl any switch.
+# Optos 46 (popper) and 51 (lockup) are handled by the virtual ball model.
+#
+# Top of playfield:  q Left Top Lane 77 | w Right Top Lane 76 | e Left Jet 63 | r Right Jet 64 | t Bottom Jet 65
+# Launch button:     y 23
+# Ramps:             a Left Ramp Entrance 52 | d Left Ramp Exit 12 | f Right Ramp Entrance 11 | g Right Ramp Exit 28
+# Loops:             z Left Loop Low 25 | x Left Loop High 78 | v Right Loop Low 67 | b Right Loop High 68
+#                    h Center Loop Reed Bottom 31 | j Center Loop Reed Top 32 | k Center Loop Rollover 74 | l Deflector 75
+# Martian targets:   u MT1 73 | i MT2 72 | o MT3 71 | p MT4 center 37 | n MT5 87 | m MT6 86   (MT7 = 85 via digits+Ctrl)
+switches:
+  q: 77
+  w: 76
+  e: 63
+  r: 64
+  t: 65
+  y: 23
+  a: 52
+  d: 12
+  f: 11
+  g: 28
+  z: 25
+  x: 78
+  v: 67
+  b: 68
+  h: 31
+  j: 32
+  k: 74
+  l: 75
+  u: 73
+  i: 72
+  o: 71
+  p: 37
+  n: 87
+  m: 86
