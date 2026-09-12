@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include "exec/memory.h"
 #include "hw/isa/isa.h"
 #include "hw/net/ne2000.h"
@@ -62,7 +63,21 @@ struct P2KSMCState {
     struct in_addr current_guest_ip;
     P2KAutoHostFwd auto_fwds[P2K_SMC_MAX_AUTO_FWDS];
     unsigned auto_fwd_count;
+    /* Receive delay.  libslirp answers a transmitted frame synchronously,
+     * inside the very I/O write that triggers the DP8390 transmit, so the
+     * reply is in the RX ring before the guest's TCP has finished updating
+     * the connection it just sent from.  XINA's TCP then resets the
+     * handshake ACK.  Delivering received frames a little later, like a
+     * real wire would, avoids that.  P2K_SMC_RX_DELAY_US overrides. */
+    GQueue rx_queue;
+    QEMUTimer *rx_timer;
+    int64_t rx_delay_ns;
 };
+
+typedef struct P2KRxFrame {
+    size_t len;
+    uint8_t data[];
+} P2KRxFrame;
 
 static P2KSMCState *p2k_auto_smc;
 
@@ -277,8 +292,155 @@ static void p2k_smc_proxy_arp_tx(P2KSMCState *s, const uint8_t *packet,
     p2k_smc_receive(qemu_get_queue(s->dp8390.nic), reply, sizeof(reply));
 }
 
+static ssize_t p2k_smc_receive_now(NetClientState *nc, const uint8_t *buf,
+                                   size_t size);
+
+static void p2k_smc_rx_deliver(void *opaque)
+{
+    P2KSMCState *s = opaque;
+    NetClientState *nc = qemu_get_queue(s->dp8390.nic);
+    P2KRxFrame *f;
+
+    while ((f = g_queue_peek_head(&s->rx_queue)) != NULL) {
+        ssize_t ret = p2k_smc_receive_now(nc, f->data, f->len);
+        if (ret <= 0 && ret != -1) {
+            /* Ring full: try again shortly. */
+            timer_mod(s->rx_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS);
+            return;
+        }
+        g_queue_pop_head(&s->rx_queue);
+        g_free(f);
+    }
+}
+
+/* XINA's TCP demultiplexer (Comer XINU tcpdemux) compares the segment's
+ * 16-bit source port zero-extended against the connection's stored remote
+ * port sign-extended.  Any peer using a source port >= 32768 therefore never
+ * matches its own connection after the SYN: the handshake ACK is answered
+ * with RST while the child connection keeps retransmitting its SYN-ACK.
+ * 1999 clients used ports below 5000; modern hosts and libslirp use 49152+.
+ * Fold such ports into 0..32767 on receive and restore them on transmit so
+ * the game code stays untouched.  P2K_SMC_PORT_FOLD=0 disables this. */
+static bool p2k_smc_port_fold_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *v = getenv("P2K_SMC_PORT_FOLD");
+        state = (v && *v && !strcmp(v, "0")) ? 0 : 1;
+    }
+    return state == 1;
+}
+
+static uint8_t *p2k_smc_tcp_header(uint8_t *f, size_t size, size_t *ip_off)
+{
+    if (size < 14 + 20 + 20 || p2k_net_be16(f + 12) != 0x0800) {
+        return NULL;
+    }
+    uint8_t *ip = f + 14;
+    if ((ip[0] >> 4) != 4 || ip[9] != 6) {
+        return NULL;
+    }
+    size_t ihl = (ip[0] & 0xf) * 4;
+    if (14 + ihl + 20 > size) {
+        return NULL;
+    }
+    *ip_off = 14;
+    return ip + ihl;
+}
+
+/* RFC 1624 incremental checksum update for one 16-bit field. */
+static void p2k_smc_tcp_csum_fix(uint8_t *tcp, unsigned oldv, unsigned newv)
+{
+    unsigned sum = (unsigned)(~p2k_net_be16(tcp + 16) & 0xffff);
+    sum += (unsigned)(~oldv & 0xffff);
+    sum += newv;
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    unsigned csum = ~sum & 0xffff;
+    tcp[16] = csum >> 8;
+    tcp[17] = csum & 0xff;
+}
+
+static uint8_t s_folded_ports[32768 / 8];
+
+static void p2k_smc_fold_rx_port(uint8_t *f, size_t size)
+{
+    size_t off;
+    uint8_t *tcp = p2k_smc_tcp_header(f, size, &off);
+    if (!tcp) {
+        return;
+    }
+    unsigned sport = p2k_net_be16(tcp);
+    if (sport < 0x8000) {
+        return;
+    }
+    unsigned folded = sport & 0x7fff;
+    static bool logged;
+    if (!logged) {
+        logged = true;
+        info_report("p2k-smc8416: folding peer TCP port %u -> %u for XINA's "
+                    "signed-port demux (P2K_SMC_PORT_FOLD=0 disables)",
+                    sport, folded);
+    }
+    s_folded_ports[folded >> 3] |= 1u << (folded & 7);
+    tcp[0] = folded >> 8;
+    tcp[1] = folded & 0xff;
+    p2k_smc_tcp_csum_fix(tcp, sport, folded);
+}
+
+static void p2k_smc_unfold_tx_port(uint8_t *f, size_t size)
+{
+    size_t off;
+    uint8_t *tcp = p2k_smc_tcp_header(f, size, &off);
+    if (!tcp) {
+        return;
+    }
+    unsigned dport = p2k_net_be16(tcp + 2);
+    if (dport >= 0x8000 || !(s_folded_ports[dport >> 3] & (1u << (dport & 7)))) {
+        return;
+    }
+    unsigned orig = dport | 0x8000;
+    tcp[2] = orig >> 8;
+    tcp[3] = orig & 0xff;
+    p2k_smc_tcp_csum_fix(tcp, dport, orig);
+}
+
 static ssize_t p2k_smc_receive(NetClientState *nc, const uint8_t *buf,
                                size_t size)
+{
+    NE2000State *dp = qemu_get_nic_opaque(nc);
+    P2KSMCState *s = container_of(dp, P2KSMCState, dp8390);
+    uint8_t *copy = NULL;
+
+    if (p2k_smc_port_fold_enabled() && size >= 54 &&
+        p2k_net_be16(buf + 12) == 0x0800 && buf[14 + 9] == 6) {
+        copy = g_memdup2(buf, size);
+        p2k_smc_fold_rx_port(copy, size);
+        buf = copy;
+    }
+    if (s->rx_delay_ns > 0) {
+        P2KRxFrame *f = g_malloc(sizeof(*f) + size);
+        f->len = size;
+        memcpy(f->data, buf, size);
+        g_queue_push_tail(&s->rx_queue, f);
+        if (!timer_pending(s->rx_timer)) {
+            timer_mod(s->rx_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->rx_delay_ns);
+        }
+        g_free(copy);
+        return size;
+    }
+    {
+        ssize_t ret = p2k_smc_receive_now(nc, buf, size);
+        g_free(copy);
+        return ret;
+    }
+}
+
+static ssize_t p2k_smc_receive_now(NetClientState *nc, const uint8_t *buf,
+                                   size_t size)
 {
     NE2000State *dp = qemu_get_nic_opaque(nc);
     P2KSMCState *s = container_of(dp, P2KSMCState, dp8390);
@@ -326,6 +488,9 @@ static void p2k_smc_dp8390_write(void *opaque, hwaddr off, uint64_t value,
             index -= NE2000_PMEM_SIZE;
         }
         if (index + dp->tcnt <= NE2000_PMEM_END) {
+            if (p2k_smc_port_fold_enabled()) {
+                p2k_smc_unfold_tx_port(dp->mem + index, dp->tcnt);
+            }
             p2k_smc_inspect_tx(s, dp->mem + index, dp->tcnt);
             p2k_smc_proxy_arp_tx(s, dp->mem + index, dp->tcnt);
         }
@@ -442,6 +607,16 @@ static void p2k_smc_realize(DeviceState *dev, Error **errp)
     p2k_smc_parse_auto_hostfwds(s, errp);
     if (*errp) {
         return;
+    }
+    {
+        const char *d = getenv("P2K_SMC_RX_DELAY_US");
+        long us = (d && *d) ? strtol(d, NULL, 10) : 0;
+        s->rx_delay_ns = us > 0 ? (int64_t)us * 1000 : 0;
+        g_queue_init(&s->rx_queue);
+        s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, p2k_smc_rx_deliver, s);
+        if (us > 0) {
+            info_report("p2k-smc8416: receive delay %ld us (P2K_SMC_RX_DELAY_US)", us);
+        }
     }
 
     memcpy(s->prom, dp->c.macaddr.a, 6);
