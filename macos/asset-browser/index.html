@@ -27,7 +27,7 @@
   .card .meta { font-size:11px; color:var(--muted); }
   .card.snd .thumb { height:36px; font-family:ui-monospace, monospace; color:var(--accent2); font-size:12px; }
   #detail { overflow:auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
-  #stage { background:repeating-conic-gradient(#1a1f2b 0 25%, #10131a 0 50%) 0 0/16px 16px; border:1px solid var(--line); border-radius:8px; display:flex; align-items:center; justify-content:center; min-height:280px; overflow:auto; padding:8px; }
+  #stage { background:repeating-conic-gradient(#1a1f2b 0 25%, #10131a 0 50%) 0 0/16px 16px; border:1px solid var(--line); border-radius:8px; display:flex; align-items:center; justify-content:safe center; min-height:280px; overflow:auto; padding:8px; }
   #stage.black { background:#000; }
   #stage canvas { image-rendering:pixelated; }
   .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
@@ -40,6 +40,10 @@
   #status { color:var(--muted); font-size:12px; }
   audio { width:100%; }
   .empty { color:var(--muted); padding:40px; text-align:center; }
+  .badge { display:inline-block; font-size:10px; padding:0 5px; border-radius:4px; background:var(--line); color:var(--muted); margin-left:4px; vertical-align:middle; }
+  .card.fnt .thumb { height:56px; }
+  input[type=text] { background:var(--bg); border:1px solid var(--line); color:var(--text); padding:6px 10px; border-radius:6px; flex:1; min-width:200px; }
+  .loading { color:var(--muted); font-size:12px; }
 </style>
 </head>
 <body>
@@ -47,7 +51,7 @@
   <img id="logo" alt="" hidden>
   <div><h1>Revenge From Mars</h1><div class="sub" id="subtitle">Pinball 2000 asset browser</div></div>
   <div class="spacer"></div>
-  <div class="tabs"><button id="tabGfx" class="active">Graphics</button><button id="tabSnd">Sounds</button></div>
+  <div class="tabs"><button data-mode="gfx" class="active">Graphics</button><button data-mode="mov">Movies</button><button data-mode="fnt">Fonts</button><button data-mode="snd">Sounds</button></div>
   <input id="search" type="search" placeholder="Filter by name…">
   <span id="status"></span>
 </header>
@@ -69,25 +73,52 @@
     return;
   }
   const logo = $('#logo'); logo.src = 'assets/p2klogo.gif'; logo.hidden = false;
-  $('#subtitle').textContent = `${data.game} · ${data.animations.filter(a => a.status === 'ok').length} animations · ${data.sounds.length} sounds · extracted ${data.generated}`;
+  const okG = data.animations.filter(a => a.status === 'ok');
+  const nMov = okG.filter(a => a.kind === 'movie').length;
+  $('#subtitle').textContent = `${data.game} · ${okG.length - nMov} graphics · ${nMov} movies · ${(data.fonts || []).length} fonts · ${data.sounds.length} sounds · extracted ${data.generated}`;
 
-  function loadSheet(a) {
-    if (imgCache.has(a.name)) return imgCache.get(a.name);
-    const p = new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = 'assets/' + a.sheet; });
-    imgCache.set(a.name, p); return p;
+  function loadImage(path) {
+    if (imgCache.has(path)) return imgCache.get(path);
+    const im = new Image();
+    const p = new Promise((res, rej) => { im.onload = () => res(im); im.onerror = rej; im.src = 'assets/' + path; });
+    p.image = im; imgCache.set(path, p); return p;
   }
-  function drawFrame(ctx, a, im, i, scale) {
-    const sx = (i % a.cols) * a.w, sy = Math.floor(i / a.cols) * a.h;
+  const sheetsOf = a => a.sheets || [a.sheet];
+  const loadSheet = (a, k = 0) => loadImage(sheetsOf(a)[k]);
+  // Returns the loaded image for frame i, or null (and kicks off the load) if it is not ready yet.
+  function sheetFor(a, i) {
+    const k = a.sheets ? Math.floor(i / a.per_sheet) : 0;
+    const p = loadSheet(a, k);
+    return p.image.complete && p.image.naturalWidth ? p.image : null;
+  }
+  function drawFrame(ctx, a, i, scale) {
+    const im = sheetFor(a, i); if (!im) return false;
+    const j = a.sheets ? i % a.per_sheet : i;
+    const sx = (j % a.cols) * a.w, sy = Math.floor(j / a.cols) * a.h;
     ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
     ctx.drawImage(im, sx, sy, a.w, a.h, 0, 0, a.w * scale, a.h * scale);
+    return true;
+  }
+  // Fonts: draw a string from the glyph sheet; returns the pixel width.
+  function drawText(ctx, f, im, text, x, y, scale) {
+    let cx = x;
+    for (const ch of text) {
+      const g = f.glyphs.find(g => g.ch === ch) || f.glyphs.find(g => g.ch === ch.toUpperCase()) || f.glyphs.find(g => g.ch === ch.toLowerCase());
+      if (!g) { cx += f.max_w * scale; continue; }
+      if (im) ctx.drawImage(im, g.sx, 0, g.w, g.h, cx + g.xo * scale, y, g.w * scale, g.h * scale);
+      cx += g.adv * scale;
+    }
+    return cx - x;
   }
 
   function render() {
     const q = search.value.trim().toLowerCase();
     list.innerHTML = '';
-    const items = mode === 'gfx'
-      ? data.animations.filter(a => !q || a.name.toLowerCase().includes(q))
+    const match = a => !q || a.name.toLowerCase().includes(q);
+    const items = mode === 'gfx' ? data.animations.filter(a => a.kind !== 'movie' && match(a))
+      : mode === 'mov' ? data.animations.filter(a => a.kind === 'movie' && match(a))
+      : mode === 'fnt' ? (data.fonts || []).filter(match)
       : data.sounds.filter(s => !q || s.name.toLowerCase().includes(q) || (s.label || '').toLowerCase().includes(q));
     status.textContent = `${items.length} shown`;
     const frag = document.createDocumentFragment();
@@ -96,19 +127,38 @@
     }, { root: list, rootMargin: '200px' });
     for (const it of items) {
       const card = document.createElement('div');
-      card.className = 'card' + (mode === 'snd' ? ' snd' : '') + (selected === it ? ' sel' : '');
-      if (mode === 'gfx') {
+      card.className = 'card' + (mode === 'snd' ? ' snd' : mode === 'fnt' ? ' fnt' : '') + (selected === it ? ' sel' : '');
+      if (mode === 'gfx' || mode === 'mov') {
         const th = document.createElement('div'); th.className = 'thumb';
         const meta = it.status === 'ok' ? `${it.w}×${it.h} · ${it.nframes} fr · ${it.fps} fps` : (it.status || '?') + (it.formats ? ' fmt ' + it.formats.join('/') : '');
+        const badge = it.kind && it.kind !== 'anim' && it.kind !== 'movie' ? `<span class="badge">${it.kind}</span>` : '';
         card.appendChild(th);
-        card.insertAdjacentHTML('beforeend', `<div class="name" title="${it.name}">${it.name}</div><div class="meta">${meta}</div>`);
+        card.insertAdjacentHTML('beforeend', `<div class="name" title="${it.name}">${it.name}${badge}</div><div class="meta">${meta}</div>`);
         if (it.status === 'ok') {
           card._load = async () => {
-            const im = await loadSheet(it);
+            // movies fade in from black: pick a frame a third of the way in for the thumbnail
+            const fi = it.kind === 'movie' ? Math.floor(it.nframes / 3) : 0;
+            const im = await loadSheet(it, it.sheets ? Math.floor(fi / it.per_sheet) : 0);
+            const j = it.sheets ? fi % it.per_sheet : 0;
             const c = document.createElement('canvas'); const s = Math.min(1, 140 / it.w, 76 / it.h);
             c.width = Math.max(1, Math.round(it.w * s)); c.height = Math.max(1, Math.round(it.h * s));
             const ctx = c.getContext('2d'); ctx.imageSmoothingEnabled = false;
-            ctx.drawImage(im, 0, 0, it.w, it.h, 0, 0, c.width, c.height); th.appendChild(c);
+            ctx.drawImage(im, (j % it.cols) * it.w, Math.floor(j / it.cols) * it.h, it.w, it.h, 0, 0, c.width, c.height); th.appendChild(c);
+          };
+          io.observe(card);
+        } else th.textContent = '—';
+      } else if (mode === 'fnt') {
+        const th = document.createElement('div'); th.className = 'thumb';
+        card.appendChild(th);
+        card.insertAdjacentHTML('beforeend', `<div class="name" title="${it.name}">${it.name}</div><div class="meta">${it.status === 'ok' ? `${it.nchars} glyphs · ${it.height} px · ${it.colors} colours` : it.status}</div>`);
+        if (it.status === 'ok') {
+          card._load = async () => {
+            const im = await loadImage(it.sheet);
+            const c = document.createElement('canvas'); const ctx = c.getContext('2d');
+            const w = drawText(ctx, it, null, 'Abc', 0, 0, 1);
+            const s = Math.min(2, 140 / Math.max(w, 1), 52 / it.cell_h);
+            c.width = Math.max(1, Math.ceil(w * s)); c.height = Math.max(1, Math.ceil(it.cell_h * s));
+            ctx.imageSmoothingEnabled = false; drawText(ctx, it, im, 'Abc', 0, 0, s); th.appendChild(c);
           };
           io.observe(card);
         } else th.textContent = '—';
@@ -135,10 +185,42 @@
       detail.innerHTML = `<h2>${it.name}</h2><div class="warn">Not decoded: ${it.status}${it.error ? ' — ' + it.error : ''}${it.formats ? ' (frame formats ' + it.formats.join(', ') + ')' : ''}</div>`;
       return;
     }
-    const im = await loadSheet(it);
+    if (mode === 'fnt') {
+      const im = await loadImage(it.sheet);
+      const scale0 = it.height < 12 ? 3 : it.height < 24 ? 2 : 1;
+      detail.innerHTML = `<h2>${it.name}</h2>
+        <div class="kv"><span>Glyphs</span><b>${it.nchars} (${it.glyphs[0].ch} … ${it.glyphs[it.glyphs.length - 1].ch})</b><span>Line height</span><b>${it.height} px (cell ${it.cell_h})</b><span>Colours</span><b>${it.colors} + transparent</b><span>Spacing</span><b>${it.spacing} px</b><span>ROM</span><b>0x${it.ptr}</b></div>
+        <div class="controls">
+          <input id="txt" type="text" value="Revenge From Mars 1999" spellcheck="false">
+          <select id="zoom">${[1,2,3,4,6].map(z => `<option value="${z}" ${z === scale0 ? 'selected' : ''}>${z}×</option>`).join('')}</select>
+          <button id="bg">Black background</button>
+          <a href="assets/${it.sheet}" download>Glyph sheet PNG</a>
+        </div>
+        <div id="stage"><canvas id="cv"></canvas></div>
+        <div class="kv"><span>All glyphs</span><b></b></div>
+        <div id="stage2" style="overflow:auto"><canvas id="cv2"></canvas></div>`;
+      const cv = $('#cv'), ctx = cv.getContext('2d');
+      let scale = scale0;
+      const draw = () => {
+        const text = $('#txt').value;
+        const w = drawText(ctx, it, null, text, 0, 0, scale);
+        cv.width = Math.max(1, w + 2 * scale); cv.height = it.cell_h * scale;
+        ctx.imageSmoothingEnabled = false; drawText(ctx, it, im, text, scale, 0, scale);
+      };
+      draw();
+      const cv2 = $('#cv2'); cv2.width = im.naturalWidth * Math.min(scale0, 2); cv2.height = im.naturalHeight * Math.min(scale0, 2);
+      const c2 = cv2.getContext('2d'); c2.imageSmoothingEnabled = false; c2.drawImage(im, 0, 0, cv2.width, cv2.height);
+      $('#txt').oninput = draw;
+      $('#zoom').onchange = e => { scale = +e.target.value; draw(); };
+      $('#bg').onclick = () => { $('#stage').classList.toggle('black'); $('#stage2').classList.toggle('black'); };
+      return;
+    }
+    // preload every sheet of a movie in order so playback does not stall
+    if (it.sheets) (async () => { for (let k = 0; k < it.sheets.length; k++) await loadSheet(it, k).catch(() => {}); })();
+    await loadSheet(it, 0);
     const scale0 = Math.max(1, Math.min(4, Math.floor(600 / it.w), Math.floor(400 / it.h)));
     detail.innerHTML = `<h2>${it.name}</h2>
-      <div class="kv"><span>Size</span><b>${it.w} × ${it.h}</b><span>Frames</span><b>${it.nframes}</b><span>Rate</span><b>${it.fps} fps</b><span>Colours</span><b>${it.colors}</b><span>Encoding</span><b>format ${it.formats.join(', ')}</b><span>ROM</span><b>bank ${it.bank} @ 0x${it.ptr}</b></div>
+      <div class="kv"><span>Size</span><b>${it.w} × ${it.h}</b><span>Frames</span><b>${it.nframes}</b><span>Rate</span><b>${it.fps} fps</b><span>Colours</span><b>${it.colors}</b><span>Encoding</span><b>format ${it.formats.join(', ')}${it.kind === 'movie' ? ' (4×4 block movie)' : ''}</b><span>ROM</span><b>${typeof it.bank === 'number' ? 'bank ' + it.bank : it.bank || '?'} @ 0x${it.ptr}</b>${it.kind ? `<span>Kind</span><b>${it.kind}</b>` : ''}</div>
       <div class="controls">
         <button id="play">⏸ Pause</button>
         <input id="scrub" type="range" min="0" max="${it.nframes - 1}" value="0">
@@ -146,28 +228,33 @@
         <select id="zoom">${[1,2,3,4,6].map(z => `<option value="${z}" ${z === scale0 ? 'selected' : ''}>${z}×</option>`).join('')}</select>
         <select id="speed"><option value="0.25">¼ speed</option><option value="0.5">½ speed</option><option value="1" selected>1× speed</option><option value="2">2× speed</option></select>
         <button id="bg">Black background</button>
-        <a href="assets/${it.sheet}" download>Sprite sheet PNG</a>
+        ${it.sheets && it.sheets.length > 1
+          ? `<details><summary>${it.sheets.length} sprite sheet PNGs</summary>${it.sheets.map((s, k) => `<a href="assets/${s}" download>sheet ${k + 1}</a>`).join(' · ')}</details>`
+          : `<a href="assets/${sheetsOf(it)[0]}" download>Sprite sheet PNG</a>`}
       </div>
       <div id="stage"><canvas id="cv"></canvas></div>
       ${it.warnings ? `<div class="warn">${it.warnings} frame(s) ended early in the byte stream.</div>` : ''}`;
     const cv = $('#cv'), ctx = cv.getContext('2d');
     const st = { i: 0, playing: it.nframes > 1, scale: scale0, speed: 1, last: 0, raf: 0 };
-    const resize = () => { cv.width = it.w * st.scale; cv.height = it.h * st.scale; drawFrame(ctx, it, im, st.i, st.scale); };
+    const resize = () => { cv.width = it.w * st.scale; cv.height = it.h * st.scale; drawFrame(ctx, it, st.i, st.scale); };
     resize();
     const tick = t => {
-      if (st.playing && t - st.last >= 1000 / (it.fps * st.speed)) { st.last = t; st.i = (st.i + 1) % it.nframes; $('#scrub').value = st.i; $('#fno').textContent = `${st.i + 1} / ${it.nframes}`; drawFrame(ctx, it, im, st.i, st.scale); }
+      if (st.playing && t - st.last >= 1000 / (it.fps * st.speed)) {
+        const next = (st.i + 1) % it.nframes;
+        if (sheetFor(it, next)) { st.last = t; st.i = next; $('#scrub').value = st.i; $('#fno').textContent = `${st.i + 1} / ${it.nframes}`; drawFrame(ctx, it, st.i, st.scale); }
+      }
       st.raf = requestAnimationFrame(tick);
     };
     st.raf = requestAnimationFrame(tick); player = st;
     $('#play').onclick = () => { st.playing = !st.playing; $('#play').textContent = st.playing ? '⏸ Pause' : '▶ Play'; };
-    $('#scrub').oninput = e => { st.playing = false; $('#play').textContent = '▶ Play'; st.i = +e.target.value; $('#fno').textContent = `${st.i + 1} / ${it.nframes}`; drawFrame(ctx, it, im, st.i, st.scale); };
+    $('#scrub').oninput = async e => { st.playing = false; $('#play').textContent = '▶ Play'; st.i = +e.target.value; $('#fno').textContent = `${st.i + 1} / ${it.nframes}`; if (!drawFrame(ctx, it, st.i, st.scale)) { await loadSheet(it, Math.floor(st.i / it.per_sheet)); drawFrame(ctx, it, st.i, st.scale); } };
     $('#zoom').onchange = e => { st.scale = +e.target.value; resize(); };
     $('#speed').onchange = e => { st.speed = +e.target.value; };
     $('#bg').onclick = () => $('#stage').classList.toggle('black');
   }
 
-  $('#tabGfx').onclick = () => { mode = 'gfx'; $('#tabGfx').classList.add('active'); $('#tabSnd').classList.remove('active'); render(); };
-  $('#tabSnd').onclick = () => { mode = 'snd'; $('#tabSnd').classList.add('active'); $('#tabGfx').classList.remove('active'); render(); };
+  for (const b of document.querySelectorAll('.tabs button'))
+    b.onclick = () => { mode = b.dataset.mode; document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('active', x === b)); render(); };
   search.oninput = render;
   render();
 })();

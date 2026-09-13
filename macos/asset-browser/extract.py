@@ -12,6 +12,13 @@ size, a colour dictionary and N frames; frames are byte-coded RLE against a 32- 
 variants 42-45), decoded exactly like the game's decompress_*_dict_rle/run_delta
 functions.  Frames are written as one sprite sheet PNG per animation.
 
+Also extracted: the 54 pict_* stills, the service-menu backgrounds and the
+system fonts that live in the update flash (pin2000_*_im_flsh0.rom, mapped at
+0x12008000), the 20 movie_* full-screen movies (format 30: a 4x4-block coder
+with skip / solid / 2-colour / 4-colour blocks, decoded like the game's
+decompress_movie_1x1) and the 11 fonts (FontData + 28-byte Character records
+with 8-bit colour-index glyphs, as drawn by Font::plot_character_ptr).
+
 Sounds: roms/rfm_sound.bin is Encore's XOR-0x3A container of 866 Ogg Vorbis
 samples named by DCS track id; the game's acd_* audio descriptors give them
 readable names.
@@ -25,7 +32,9 @@ REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
 
 # ---------------------------------------------------------------- ROM access
 class Banks:
-    def __init__(self, roms):
+    IM_BASE = 0x12008000   # *_im_flsh0.rom sits behind the 32 KiB boot block of the BAR3 update flash
+    def __init__(self, roms, im_flash=None):
+        self.im = open(im_flash, 'rb').read() if im_flash else b''
         pairs = [('rfm_u100.rom','rfm_u101.rom'),('rfm_u102.rom','rfm_u103.rom'),
                  ('rfm_u104.rom','rfm_u105.rom'),('rfm_u106.rom','rfm_u107.rom')]
         self.b = []
@@ -38,6 +47,9 @@ class Banks:
         if 0x14000000 <= addr < 0x18000000:
             b = (addr - 0x14000000) >> 24; o = addr & 0xffffff
             return self.b[b][o:o + n]
+        if self.IM_BASE <= addr < self.IM_BASE + len(self.im):
+            o = addr - self.IM_BASE
+            return self.im[o:o + n]
         raise ValueError("address %x not in flash windows" % addr)
 
 def load_symbols(path):
@@ -71,6 +83,9 @@ def parse_anim(banks, ptr):
 
 DICT_FORMATS = {22: 6, 23: 5, 42: 6, 43: 5, 44: 6, 45: 5}   # format -> colour index bits
 LRLE_FORMATS = {21}                                          # 16-bit line RLE (decompress_*_l_rle)
+RAW_FORMATS = {20}                                           # 16-bit raw (decompress_15bit_image_raw)
+RAW8_FORMATS = {0}                                           # 8-bit raw indices into the Animation palette
+MOVIE_FORMAT = 30                                            # decompress_movie_1x1
 
 def decode_lrle15(data, w, h):
     """Format 21: per row, words of {count|0x8000?}: high bit clear = run of the next
@@ -178,6 +193,13 @@ def decode_frame(banks, anim, i, cache):
     fmt, w, h, x, y, dp = anim['frames'][i]
     if fmt in LRLE_FORMATS:
         return decode_lrle15(banks.rd(dp, 1 << 21), w, h)
+    if fmt in RAW_FORMATS:
+        raw = banks.rd(dp, w * h * 2)
+        return array('H', raw[:w * h * 2]), ('short' if len(raw) < w * h * 2 else None)
+    if fmt in RAW8_FORMATS:
+        pal = struct.unpack('<%dH' % anim['pal_count'], banks.rd(anim['pal_ptr'], anim['pal_count'] * 2))
+        raw = banks.rd(dp, w * h)
+        return array('H', [pal[b] if b < len(pal) else TRANSPARENT for b in raw]), ('short' if len(raw) < w * h else None)
     bits = DICT_FORMATS.get(fmt)
     if bits is None: raise NotImplementedError("format %d" % fmt)
     key = (anim['pal_ptr'], bits)
@@ -189,12 +211,104 @@ def decode_frame(banks, anim, i, cache):
     data = banks.rd(dp, 1 << 21)
     return decode_dict_rle(data, w, h, pal, pairs, fmt, bits)
 
+
+# ---------------------------------------------------------------- movies (format 30)
+def _interp3(a, b): return (a + 2 * b) // 3
+
+def decode_movie_frame(data, w, h, canvas):
+    """One format-30 frame, applied to `canvas` (array of RGB555, w*h) in place.
+    LSB-first bitstream over 4x4 blocks in raster order; per block a 2-bit opcode:
+      0: 4-colour block: r0 r1 g0 g1 b0 b1 (5 bits each) then 16 x 2-bit indices into
+         [c0, (c0+2c1)/3, (2c0+c1)/3, c1] (per channel, like the game's *_interpolate tables)
+      1: keep the previous frame's pixels
+      2: solid block: one 15-bit colour
+      3: 2-colour block: r0 r1 g0 g1 b0 b1 then 16 x 1-bit indices into [c0, c1]
+    Returns the number of bytes consumed."""
+    buf = data[0] | data[1] << 8 | data[2] << 16 | data[3] << 24; nb = 32; p = 4
+    for by in range(0, h, 4):
+        rows = [(by + k) * w for k in range(4)]
+        for bx in range(0, w, 4):
+            if nb <= 24:
+                while nb <= 24: buf |= data[p] << nb; p += 1; nb += 8
+            op = buf & 3; buf >>= 2; nb -= 2
+            if op == 1: continue
+            if op == 2:
+                while nb <= 24: buf |= data[p] << nb; p += 1; nb += 8
+                c = buf & 0x7fff; buf >>= 15; nb -= 15
+                for r in rows: canvas[r + bx:r + bx + 4] = array('H', (c, c, c, c))
+                continue
+            while nb <= 24: buf |= data[p] << nb; p += 1; nb += 8
+            r0 = buf & 31; r1 = (buf >> 5) & 31; buf >>= 10; nb -= 10
+            while nb <= 24: buf |= data[p] << nb; p += 1; nb += 8
+            g0 = buf & 31; g1 = (buf >> 5) & 31; buf >>= 10; nb -= 10
+            while nb <= 24: buf |= data[p] << nb; p += 1; nb += 8
+            b0 = buf & 31; b1 = (buf >> 5) & 31; buf >>= 10; nb -= 10
+            c0 = r0 << 10 | g0 << 5 | b0; c1 = r1 << 10 | g1 << 5 | b1
+            if op == 0:
+                pal = (c0, _interp3(r0, r1) << 10 | _interp3(g0, g1) << 5 | _interp3(b0, b1),
+                       _interp3(r1, r0) << 10 | _interp3(g1, g0) << 5 | _interp3(b1, b0), c1)
+                for r in rows:
+                    while nb <= 24: buf |= data[p] << nb; p += 1; nb += 8
+                    canvas[r + bx:r + bx + 4] = array('H', (pal[buf & 3], pal[(buf >> 2) & 3], pal[(buf >> 4) & 3], pal[(buf >> 6) & 3]))
+                    buf >>= 8; nb -= 8
+            else:
+                while nb <= 24: buf |= data[p] << nb; p += 1; nb += 8
+                for r in rows:
+                    canvas[r + bx:r + bx + 4] = array('H', (c1 if buf & 1 else c0, c1 if buf & 2 else c0, c1 if buf & 4 else c0, c1 if buf & 8 else c0))
+                    buf >>= 4; nb -= 4
+    return p
+
+def decode_movie(banks, anim):
+    """Yields (frame_index, canvas copy) for every frame of a format-30 movie."""
+    w, h = anim['w'], anim['h']
+    canvas = array('H', [0]) * (w * h)
+    for i, (fmt, fw, fh, x, y, dp) in enumerate(anim['frames']):
+        nxt = anim['frames'][i + 1][5] if i + 1 < len(anim['frames']) else dp + (1 << 20)
+        data = banks.rd(dp, max(nxt - dp, 0) + 8)
+        decode_movie_frame(data, fw, fh, canvas)
+        yield i, array('H', canvas)
+
+# ---------------------------------------------------------------- fonts
+FONT_COLORS = [b'\0\0\0\0', b'\xff\xff\xff\xff', b'\xff\xb4\x28\xff', b'\xff\x50\x50\xff', b'\x50\xa0\xff\xff', b'\x7e\xe7\x87\xff']
+
+def parse_font(banks, ptr):
+    """FontData {nchars, height, max_w, ncolors, spacing, chars*}; Character (28 bytes)
+    {code, x_off, baseline, w, h, advance (0 = w + spacing), pixels*}; pixels are one
+    byte per pixel: 0 transparent, else an index into the Font's colour table."""
+    nchars, height, max_w, ncolors, spacing, tab = struct.unpack('<6I', banks.rd(ptr, 24))
+    glyphs = []
+    for i in range(nchars):
+        code, xo, base, w, h, adv, dp = struct.unpack('<7I', banks.rd(tab + i * 28, 28))
+        xo = xo - (1 << 32) if xo >= 1 << 31 else xo
+        base = base - (1 << 32) if base >= 1 << 31 else base
+        glyphs.append(dict(ch=chr(code & 0xff), xo=xo, base=base, w=w, h=h, adv=adv or (w + spacing), data=dp))
+    return dict(nchars=nchars, height=height, max_w=max_w, ncolors=ncolors, spacing=spacing, glyphs=glyphs)
+
+def font_sheet(banks, font, path):
+    """All glyphs side by side (1 px gap) in one PNG; returns the glyph list with sheet x."""
+    gl = font['glyphs']
+    top = min(g['base'] - g['h'] for g in gl); bottom = max(g['base'] for g in gl)
+    H = max(1, bottom - top); W = sum(g['w'] + 1 for g in gl)
+    lines = [bytearray(W * 4) for _ in range(H)]
+    x = 0; out = []
+    for g in gl:
+        px = banks.rd(g['data'], g['w'] * g['h'])
+        y0 = g['base'] - g['h'] - top
+        for y in range(g['h']):
+            row = px[y * g['w']:(y + 1) * g['w']]
+            lines[y0 + y][x * 4:(x + g['w']) * 4] = b''.join(FONT_COLORS[min(v, len(FONT_COLORS) - 1)] for v in row)
+        out.append(dict(ch=g['ch'], sx=x, sy=0, w=g['w'], h=H, xo=g['xo'], adv=g['adv']))
+        x += g['w'] + 1
+    png_from_rgba_rows(lines, W, H, path)
+    return out, W, H, top
+
 # ---------------------------------------------------------------- PNG output
 LUT = [None] * 65536
 def _lut():
     for v in range(32768):
         r = (v >> 10) & 31; g = (v >> 5) & 31; b = v & 31
         LUT[v] = bytes((r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2, 255))
+    for v in range(32768, 65536): LUT[v] = LUT[v & 0x7fff]   # high bit ignored by the 15-bit display
     LUT[TRANSPARENT] = b'\0\0\0\0'
 _lut()
 
@@ -203,9 +317,16 @@ def png_from_rgba_rows(rows, w, h, path):
     raw = b''.join(b'\0' + r for r in rows)
     open(path, 'wb').write(b'\x89PNG\r\n\x1a\n' + ch(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)) + ch(b'IDAT', zlib.compress(raw, 6)) + ch(b'IEND', b''))
 
-def sheet(frames_pix, sizes, w, h, path, max_w=2048):
+try:
+    import numpy as _np
+    _NPLUT = _np.frombuffer(b''.join(LUT[v] if LUT[v] else b'\0\0\0\0' for v in range(65536)), dtype=_np.uint32)
+    def rgba_row(row): return _NPLUT[_np.frombuffer(row.tobytes() if hasattr(row, 'tobytes') else bytes(row), dtype=_np.uint16)].tobytes()
+except ImportError:
+    def rgba_row(row): return b''.join(LUT[v] for v in row)
+
+def sheet(frames_pix, sizes, w, h, path, max_w=2048, cols=None):
     n = len(frames_pix)
-    cols = max(1, min(n, max_w // max(w, 1)))
+    if cols is None: cols = max(1, min(n, max_w // max(w, 1)))
     rows = (n + cols - 1) // cols
     SW, SH = cols * w, rows * h
     lines = [bytearray(SW * 4) for _ in range(SH)]
@@ -214,7 +335,7 @@ def sheet(frames_pix, sizes, w, h, path, max_w=2048):
         cx, cy = (i % cols) * w, (i // cols) * h
         for y in range(fh):
             line = lines[cy + y]; row = pix[y * fw:(y + 1) * fw]
-            line[cx * 4:(cx + fw) * 4] = b''.join(LUT[v] for v in row)
+            line[cx * 4:(cx + fw) * 4] = rgba_row(row)
     png_from_rgba_rows(lines, SW, SH, path)
     return cols, rows
 
@@ -249,56 +370,116 @@ def acd_labels(game_rom, syms):
     return labels
 
 # ---------------------------------------------------------------- main
+CATEGORIES = [  # (symbol regex, kind, name group)
+    (r'anim_(.*)_ptr$', 'anim'),
+    (r'pict_(.*)_ptr$', 'pict'),
+    (r'movie_(.*)_ptr$', 'movie'),
+    (r'(menu_background_.*|system_video_test_align)_ptr$', 'menu'),
+]
+
+def extract_graphic(banks, a, name, kind, ptr, cache, log):
+    rec = dict(name=name, kind=kind, ptr='%08x' % ptr,
+               bank=(ptr - 0x14000000) >> 24 if 0x14000000 <= ptr < 0x18000000 else ('update flash' if ptr >= 0x12000000 and ptr < 0x14000000 else None))
+    try:
+        an = parse_anim(banks, ptr)
+    except Exception as e:
+        rec.update(status='unreadable', error=str(e)); return rec
+    fmts = sorted(set(f[0] for f in an['frames']))
+    rec.update(nframes=an['nframes'], fps=an['rate'], w=an['w'], h=an['h'], colors=an['pal_count'], formats=fmts)
+    if fmts == [MOVIE_FORMAT]:
+        w, h = an['w'], an['h']
+        cols = max(1, min(an['nframes'], 2048 // w)); per = cols * max(1, 2048 // h)
+        sheets = []; batch = []
+        def flush():
+            k = len(sheets); fn = 'gfx/%s_%d.png' % (name, k)
+            sheet(batch, [(w, h)] * len(batch), w, h, os.path.join(a.out, fn), cols=cols)
+            sheets.append(fn); batch.clear()
+        for i, canvas in decode_movie(banks, an):
+            batch.append(canvas)
+            if len(batch) == per: flush()
+            if i % 50 == 49: log('  %s frame %d/%d' % (name, i + 1, an['nframes']))
+        if batch: flush()
+        rec.update(status='ok', sheets=sheets, per_sheet=per, cols=cols, rows=(per + cols - 1) // cols, warnings=0)
+        return rec
+    if not all(f in DICT_FORMATS or f in LRLE_FORMATS or f in RAW_FORMATS or f in RAW8_FORMATS for f in fmts):
+        rec.update(status='unsupported'); return rec
+    pix = []; warn = 0; sizes = []
+    for i in range(an['nframes']):
+        fmt, fw, fh = an['frames'][i][:3]
+        try:
+            p, err = decode_frame(banks, an, i, cache)
+        except Exception as e:
+            rec.update(status='unreadable', error='frame %d: %s' % (i, e)); return rec
+        pix.append(p); sizes.append((fw, fh)); warn += bool(err)
+    cw = max(sz[0] for sz in sizes); chh = max(sz[1] for sz in sizes)
+    cols, rows = sheet(pix, sizes, cw, chh, os.path.join(a.out, 'gfx', name + '.png'))
+    rec.update(status='ok', sheet='gfx/' + name + '.png', cols=cols, rows=rows, warnings=warn, w=cw, h=chh)
+    if any(sz != (cw, chh) for sz in sizes): rec['frame_sizes'] = sizes
+    return rec
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default=os.path.join(HERE, 'assets'))
     ap.add_argument('--roms', default=os.path.join(REPO, 'roms'))
     ap.add_argument('--update', default=os.path.join(REPO, 'updates', 'pin2000_50070_0160_09222003_B_10000000', '50070'))
-    ap.add_argument('--limit', type=int, default=0, help='only first N animations (testing)')
+    ap.add_argument('--only', default='', help='regex: only extract graphics/fonts whose name matches (testing)')
+    ap.add_argument('--no-sounds', action='store_true')
     a = ap.parse_args()
     os.makedirs(os.path.join(a.out, 'gfx'), exist_ok=True)
+    os.makedirs(os.path.join(a.out, 'fonts'), exist_ok=True)
     t0 = time.time()
-    banks = Banks(a.roms)
-    game_rom = os.path.join(a.update, 'pin2000_50070_0160_game.rom')
-    syms = load_symbols(os.path.join(a.update, 'pin2000_50070_0160_symbols.rom'))
+    log = lambda s: print('%6.0fs %s' % (time.time() - t0, s), flush=True)
+    def upd(suffix): return os.path.join(a.update, 'pin2000_50070_0160_' + suffix)
+    banks = Banks(a.roms, upd('im_flsh0.rom'))
+    game_rom = upd('game.rom')
+    syms = load_symbols(upd('symbols.rom'))
     g = open(game_rom, 'rb').read()
+    only = re.compile(a.only) if a.only else None
     # logo gif served by the game's http server
     i = g.find(b'GIF89a')
     if i >= 0:
         j = g.find(b'\x00\x3b', i); open(os.path.join(a.out, 'p2klogo.gif'), 'wb').write(g[i:j + 2])
-    anims = []
-    names = sorted((addr, s) for addr, s in syms.items() if re.match(r'anim_.*_ptr$', s))
-    if a.limit: names = names[:a.limit]
-    cache = {}
-    for k, (addr, sym) in enumerate(names):
-        name = sym[5:-4]
+    # graphics: animations, stills, service-menu backgrounds, movies
+    items = []
+    for addr, s in sorted(syms.items()):
+        for pat, kind in CATEGORIES:
+            m = re.match(pat, s)
+            if m:
+                items.append((kind, m.group(1), addr)); break
+    if only: items = [it for it in items if only.search(it[1])]
+    anims = []; cache = {}
+    for k, (kind, name, addr) in enumerate(items):
         ptr = struct.unpack_from('<I', g, addr - 0x100000)[0]
-        rec = dict(name=name, ptr='%08x' % ptr, bank=(ptr - 0x14000000) >> 24 if 0x14000000 <= ptr < 0x18000000 else None)
-        try:
-            an = parse_anim(banks, ptr)
-        except Exception as e:
-            rec.update(status='unreadable', error=str(e)); anims.append(rec); continue
-        fmts = sorted(set(f[0] for f in an['frames']))
-        rec.update(nframes=an['nframes'], fps=an['rate'], w=an['w'], h=an['h'], colors=an['pal_count'], formats=fmts)
-        if not all(f in DICT_FORMATS or f in LRLE_FORMATS for f in fmts):
-            rec.update(status='unsupported'); anims.append(rec); continue
-        pix = []; warn = 0; sizes = []
-        for i in range(an['nframes']):
-            fmt, fw, fh = an['frames'][i][:3]
-            p, err = decode_frame(banks, an, i, cache); pix.append(p); sizes.append((fw, fh)); warn += bool(err)
-        cw = max(sz[0] for sz in sizes); chh = max(sz[1] for sz in sizes)
-        cols, rows = sheet(pix, sizes, cw, chh, os.path.join(a.out, 'gfx', name + '.png'))
-        rec.update(status='ok', sheet='gfx/' + name + '.png', cols=cols, rows=rows, warnings=warn, w=cw, h=chh)
-        if any(sz != (cw, chh) for sz in sizes): rec['frame_sizes'] = sizes
+        rec = extract_graphic(banks, a, name, kind, ptr, cache, log)
         anims.append(rec)
-        if k % 20 == 0:
-            print("[%3d/%d] %-40s %4dx%-4d %4d frames %.0fs" % (k, len(names), name, an['w'], an['h'], an['nframes'], time.time() - t0), flush=True)
-    labels = acd_labels(game_rom, syms)
-    sounds = extract_sounds(os.path.join(a.roms, 'rfm_sound.bin'), os.path.join(a.out, 'sounds'), labels)
-    json.dump(dict(game='Revenge From Mars 1.6', generated=time.strftime('%Y-%m-%d %H:%M'), animations=anims, sounds=sounds),
+        if k % 25 == 0 or kind == 'movie':
+            log('[%3d/%d] %-5s %-40s %s' % (k, len(items), kind, name, rec.get('status') + (' %dx%d %d fr' % (rec['w'], rec['h'], rec['nframes']) if 'w' in rec else '')))
+    # fonts
+    fonts = []
+    for addr, s in sorted(syms.items()):
+        m = re.match(r'font_(.*)_data_ptr$', s)
+        if not m or (only and not only.search(m.group(1))): continue
+        name = m.group(1); ptr = struct.unpack_from('<I', g, addr - 0x100000)[0]
+        rec = dict(name=name, ptr='%08x' % ptr)
+        try:
+            f = parse_font(banks, ptr)
+            glyphs, W, H, top = font_sheet(banks, f, os.path.join(a.out, 'fonts', name + '.png'))
+            rec.update(status='ok', sheet='fonts/%s.png' % name, nchars=f['nchars'], height=f['height'], max_w=f['max_w'], colors=f['ncolors'],
+                       spacing=f['spacing'], cell_h=H, top=top, glyphs=glyphs)
+        except Exception as e:
+            rec.update(status='unreadable', error=str(e))
+        fonts.append(rec)
+    log('%d fonts' % len(fonts))
+    sounds = []
+    if not a.no_sounds:
+        labels = acd_labels(game_rom, syms)
+        sounds = extract_sounds(os.path.join(a.roms, 'rfm_sound.bin'), os.path.join(a.out, 'sounds'), labels)
+    json.dump(dict(game='Revenge From Mars 1.6', generated=time.strftime('%Y-%m-%d %H:%M'), animations=anims, fonts=fonts, sounds=sounds),
               open(os.path.join(a.out, 'index.json'), 'w'), indent=1)
     ok = sum(1 for x in anims if x.get('status') == 'ok')
-    print("done: %d/%d animations decoded, %d sounds, %.0fs" % (ok, len(anims), len(sounds), time.time() - t0))
+    for x in anims:
+        if x.get('status') != 'ok': log('  not decoded: %s %s (%s %s)' % (x['kind'], x['name'], x.get('status'), x.get('error', x.get('formats'))))
+    log("done: %d/%d graphics decoded, %d fonts, %d sounds" % (ok, len(anims), len(fonts), len(sounds)))
 
 if __name__ == '__main__':
     main()
